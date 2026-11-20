@@ -237,8 +237,11 @@ def clear_match(section_id: str, key: str) -> None:
 refresh_callbacks = set()
 
 
-def broadcast_update() -> None:
+def broadcast_update(exclude=None) -> None:
+    """Refresh connected viewers, optionally leaving the editing browser untouched."""
     for callback in list(refresh_callbacks):
+        if callback is exclude:
+            continue
         try:
             callback()
         except Exception:
@@ -271,6 +274,7 @@ def match_status(state: dict[str, Any], key: str) -> str:
 @ui.page("/")
 def main_page(client: Client) -> None:
     selected_section = {"id": "section_1"}
+    refresh_self = None
 
     @ui.refreshable
     def render_application() -> None:
@@ -300,7 +304,9 @@ def main_page(client: Client) -> None:
                     ).classes("w-48")
 
                 if admin:
-                    with ui.expansion("Team setup and registration", icon="groups").classes("w-full"):
+                    team_name_inputs = {}
+                    with ui.expansion("Team setup and registration", icon="groups", value=True).classes("w-full"):
+                        ui.label("Edit all six names, then save them together. Logo uploads are saved immediately.").classes("text-sm text-gray-500")
                         for team in sorted(state["teams"], key=lambda item: item["seed"]):
                             with ui.row().classes("w-full items-center gap-2"):
                                 ui.label(f"Seed {team['seed']}").classes("w-16 text-sm")
@@ -308,12 +314,7 @@ def main_page(client: Client) -> None:
                                     value=team["name"],
                                     placeholder="Team name",
                                 ).classes("flex-grow")
-                                name_input.on(
-                                    "blur",
-                                    lambda e, tid=team["id"], inp=name_input: update_team_name(
-                                        section_id, tid, inp.value
-                                    ),
-                                )
+                                team_name_inputs[team["id"]] = name_input
                                 if team.get("logo"):
                                     ui.image(team["logo"]).classes("w-10 h-10 object-contain")
                                 ui.upload(
@@ -323,6 +324,20 @@ def main_page(client: Client) -> None:
                                         section_id, tid, e
                                     ),
                                 ).props("accept=.png,.jpg,.jpeg,.webp max-files=1").classes("max-w-36")
+
+                        def save_team_setup() -> None:
+                            if not is_admin(client):
+                                return
+                            latest = load_section(section_id)
+                            for tid, field in team_name_inputs.items():
+                                team_record = team_by_id(latest, tid)
+                                if team_record and field.value and field.value.strip():
+                                    team_record["name"] = field.value.strip()
+                            save_section(section_id, latest)
+                            broadcast_update()
+                            ui.notify("Team names saved.", type="positive")
+
+                        ui.button("Save team names", icon="save", on_click=save_team_setup).props("color=primary")
 
 
             if not admin:
@@ -359,7 +374,7 @@ def main_page(client: Client) -> None:
         if team and name.strip():
             team["name"] = name.strip()
             save_section(section_id, state)
-            broadcast_update()
+            broadcast_update(exclude=refresh_self)
 
     async def upload_logo(section_id: str, team_id: str, event) -> None:
         if not is_admin(client):
@@ -419,18 +434,115 @@ def main_page(client: Client) -> None:
         dialog.close()
         broadcast_update()
 
-    def render_match_groups(section_id: str, state: dict, admin: bool) -> None:
-        groups = [
-            ("Winners Bracket", ["M1", "M2", "M3", "M4", "M5"]),
-            ("Losers Bracket", ["LB1", "LB2", "LB3", "LB4"]),
-            ("Championship", ["GF", "RESET"]),
+
+    def render_bracket_svg(state: dict[str, Any]) -> str:
+        """Responsive, connected bracket diagram following the supplied concept."""
+        width, height = 1320, 900
+        card_w, card_h = 190, 86
+        positions = {
+            "M1": (55, 105), "M2": (55, 285),
+            "M3": (315, 105), "M4": (315, 285),
+            "M5": (575, 195),
+            "LB1": (55, 535), "LB2": (55, 725),
+            "LB3": (315, 630), "LB4": (575, 535),
+            "GF": (845, 365), "RESET": (1100, 365),
+        }
+        titles = {key: title for key, title, _ in MATCHES}
+        svg = [
+            f'<div style="width:100%;overflow-x:auto;background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:12px">',
+            f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="Six-team double elimination bracket" style="display:block;width:100%;min-width:900px;height:auto;font-family:Arial,sans-serif">',
+            '<defs><style>.connector{fill:none;stroke:#64748b;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round}.dash{stroke-dasharray:9 8}.coltitle{font-size:17px;font-weight:700;fill:#334155;letter-spacing:1px}.matchbox{fill:#fff;stroke:#94a3b8;stroke-width:1.5}.matchtitle{font-size:14px;font-weight:700;fill:#475569}.teamname{font-size:14px;fill:#0f172a}.score{font-size:15px;font-weight:700;fill:#0f172a}.winner{font-weight:700;fill:#047857}.muted{fill:#94a3b8}</style></defs>',
+            '<text x="55" y="35" class="coltitle">WINNERS BRACKET</text><text x="55" y="475" class="coltitle">LOSERS BRACKET</text><text x="845" y="315" class="coltitle">CHAMPIONSHIP</text>',
         ]
-        for group_name, keys in groups:
-            with ui.card().classes("w-full"):
-                ui.label(group_name).classes("text-lg font-bold")
-                with ui.grid(columns=1).classes("w-full md:grid-cols-2 xl:grid-cols-3 gap-3"):
-                    for key in keys:
-                        render_match_card(section_id, state, key, admin)
+        # Orthogonal connectors, matching the supplied bracket's flow.
+        def path_between(src, dst, dashed=False):
+            sx, sy = positions[src]; dx, dy = positions[dst]
+            x1, y1 = sx + card_w, sy + card_h / 2
+            x2, y2 = dx, dy + card_h / 2
+            mid = (x1 + x2) / 2
+            cls = "connector dash" if dashed else "connector"
+            return f'<path class="{cls}" d="M{x1},{y1} H{mid} V{y2} H{x2}"/>'
+        for src, dst in [
+            ("M1","M3"), ("M2","M4"), ("M3","M5"), ("M4","M5"),
+            ("M1","LB1"), ("M2","LB1"), ("M3","LB2"), ("M4","LB2"),
+            ("LB1","LB3"), ("LB2","LB3"), ("LB3","LB4"), ("M5","LB4"),
+            ("M5","GF"), ("LB4","GF")
+        ]:
+            svg.append(path_between(src, dst))
+        svg.append(path_between("GF", "RESET", True))
+
+        def short_label(team_id):
+            team = team_by_id(state, team_id)
+            if not team:
+                return "TBD"
+            return f"#{team['seed']} {team['name']}"
+
+        def match_box(key):
+            x, y = positions[key]
+            a, b = participants(state, key)
+            result = state["results"].get(key, {})
+            reset_active = False
+            if key == "RESET":
+                gf_winner = result_winner(state, "GF")
+                lb_finalist = participants(state, "GF")[1]
+                reset_active = bool(gf_winner and gf_winner == lb_finalist)
+            label = titles[key]
+            if key == "GF":
+                label = "MATCH 6 · GRAND FINAL"
+            if key == "RESET":
+                label = "L6 OPTION · RESET"
+            if key == "RESET" and not reset_active:
+                return (
+                    f'<g><rect x="{x}" y="{y}" width="{card_w}" height="{card_h}" rx="9" '
+                    f'fill="#fff" stroke="#64748b" stroke-width="2" stroke-dasharray="8 6"/>'
+                    f'<text class="matchtitle" x="{x+11}" y="{y+25}">L6 OPTION · RESET</text>'
+                    f'<text x="{x+11}" y="{y+51}" font-size="13" fill="#64748b">If lower finalist wins Match 6</text></g>'
+                )
+            rows = []
+            for idx, (team_id, score_key) in enumerate(((a, "score_a"), (b, "score_b"))):
+                team = team_by_id(state, team_id)
+                name = html.escape(short_label(team_id))
+                score = result.get(score_key, "")
+                is_winner = bool(team_id and result.get("winner_id") == team_id)
+                cls = "teamname winner" if is_winner else "teamname"
+                if team and team.get("logo"):
+                    logo = html.escape(team["logo"], quote=True)
+                    rows.append(f'<image href="{logo}" x="{x+9}" y="{y+29+idx*25}" width="19" height="19" preserveAspectRatio="xMidYMid meet"/>')
+                    tx = x + 34
+                else:
+                    tx = x + 12
+                rows.append(f'<text class="{cls}" x="{tx}" y="{y+44+idx*25}">{name[:22]}</text>')
+                rows.append(f'<text class="score" text-anchor="end" x="{x+card_w-12}" y="{y+44+idx*25}">{html.escape(str(score))}</text>')
+                if is_winner:
+                    rows.append(f'<text x="{x+card_w-29}" y="{y+44+idx*25}" font-size="12" fill="#059669">★</text>')
+            return (
+                f'<g><rect class="matchbox" x="{x}" y="{y}" width="{card_w}" height="{card_h}" rx="9"/>'
+                f'<text class="matchtitle" x="{x+11}" y="{y+19}">{html.escape(label)}</text>'
+                + "".join(rows) + '</g>'
+            )
+        for key in positions:
+            svg.append(match_box(key))
+        # Conditional reset annotation and dashed destination.
+        svg.append('<text x="1095" y="485" font-size="16" fill="#64748b">Only if lower-bracket</text><text x="1095" y="506" font-size="16" fill="#64748b">finalist wins Match 6</text>')
+        svg.append('<path class="connector dash" d="M1290,408 H1310"/>')
+        svg.append('</svg></div>')
+        return "".join(svg)
+
+    def render_match_groups(section_id: str, state: dict, admin: bool) -> None:
+        ui.html(render_bracket_svg(state), sanitize=False).classes("w-full")
+        if admin:
+            with ui.expansion("Match controls — enter scores and correct results", icon="edit").classes("w-full"):
+                ui.label("Saving a result recalculates later matches. Correcting an earlier result clears affected downstream results.").classes("text-sm text-gray-500")
+                groups = [
+                    ("Winners bracket", ["M1", "M2", "M3", "M4", "M5"]),
+                    ("Losers bracket", ["LB1", "LB2", "LB3", "LB4"]),
+                    ("Championship", ["GF", "RESET"]),
+                ]
+                for group_name, keys in groups:
+                    ui.label(group_name).classes("font-bold text-base mt-3")
+                    with ui.grid(columns=1).classes("w-full md:grid-cols-2 xl:grid-cols-3 gap-3"):
+                        for key in keys:
+                            render_match_card(section_id, state, key, admin)
 
     def render_match_card(section_id: str, state: dict, key: str, admin: bool) -> None:
         a, b = participants(state, key)
@@ -537,9 +649,10 @@ def main_page(client: Client) -> None:
         app.storage.user["is_admin"] = False
         render_application.refresh()
 
+    refresh_self = render_application.refresh
     render_application()
-    refresh_callbacks.add(render_application.refresh)
-    client.on_disconnect(lambda: refresh_callbacks.discard(render_application.refresh))
+    refresh_callbacks.add(refresh_self)
+    client.on_disconnect(lambda: refresh_callbacks.discard(refresh_self))
 
 
 ui.run(
