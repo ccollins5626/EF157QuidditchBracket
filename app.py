@@ -1,7 +1,7 @@
+import html
 import json
 import os
 import secrets
-import html
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -276,12 +276,19 @@ def match_status(state: dict[str, Any], key: str) -> str:
 def main_page(client: Client) -> None:
     selected_section = {"id": "section_1"}
     refresh_self = None
+    # Snapshot this browser's own login state into its page closure. A broadcast
+    # refresh can be initiated by a different browser, so it must never consult
+    # that browser's current app.storage.user context while rebuilding this page.
+    admin_session = {"enabled": bool(app.storage.user.get("is_admin"))}
+
+    def current_user_is_admin() -> bool:
+        return admin_session["enabled"]
 
     @ui.refreshable
     def render_application() -> None:
         section_id = selected_section["id"]
         state = load_section(section_id)
-        admin = is_admin(client)
+        admin = current_user_is_admin()
 
         with ui.column().classes("w-full max-w-7xl mx-auto p-3 md:p-6 gap-4"):
             with ui.row().classes("w-full items-center justify-between"):
@@ -327,7 +334,7 @@ def main_page(client: Client) -> None:
                                 ).props("accept=.png,.jpg,.jpeg,.webp max-files=1").classes("max-w-36")
 
                         def save_team_setup() -> None:
-                            if not is_admin(client):
+                            if not current_user_is_admin():
                                 return
                             latest = load_section(section_id)
                             for tid, field in team_name_inputs.items():
@@ -368,7 +375,7 @@ def main_page(client: Client) -> None:
         render_application.refresh()
 
     def update_team_name(section_id: str, team_id: str, name: str) -> None:
-        if not is_admin(client):
+        if not current_user_is_admin():
             return
         state = load_section(section_id)
         team = team_by_id(state, team_id)
@@ -378,7 +385,7 @@ def main_page(client: Client) -> None:
             broadcast_update(exclude=refresh_self)
 
     async def upload_logo(section_id: str, team_id: str, event) -> None:
-        if not is_admin(client):
+        if not current_user_is_admin():
             return
         filename = Path(event.file.name).name
         suffix = Path(filename).suffix.lower()
@@ -621,7 +628,7 @@ def main_page(client: Client) -> None:
     # Public header / administrator sign-in
     with ui.column().classes("w-full"):
         with ui.row().classes("w-full justify-end p-3"):
-            if is_admin(client):
+            if current_user_is_admin():
                 ui.button(
                     "Log out",
                     icon="logout",
@@ -635,6 +642,7 @@ def main_page(client: Client) -> None:
                     def attempt_login() -> None:
                         if ADMIN_PASSWORD and password.value == ADMIN_PASSWORD:
                             app.storage.user["is_admin"] = True
+                            admin_session["enabled"] = True
                             login_dialog.close()
                             render_application.refresh()
                             ui.notify("Administrator access enabled.", type="positive")
@@ -648,6 +656,7 @@ def main_page(client: Client) -> None:
 
     def logout() -> None:
         app.storage.user["is_admin"] = False
+        admin_session["enabled"] = False
         render_application.refresh()
 
     refresh_self = render_application.refresh
