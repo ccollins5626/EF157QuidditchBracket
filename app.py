@@ -1,4 +1,6 @@
+import csv
 import html
+import io
 import json
 import os
 import secrets
@@ -53,6 +55,85 @@ MATCHES = [
     ("GF", "Match 6", "Grand Final"),
     ("RESET", "L6 Option — Championship Reset", "Grand Final"),
 ]
+
+
+EXPORT_COLUMNS = [
+    "Section", "Round", "Match", "Team 1", "Team 1 Seed", "Score 1",
+    "Team 2", "Team 2 Seed", "Score 2", "Winner", "Champion",
+]
+
+
+def completed_export_rows(section_id: str, state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build completed-match rows from the same JSON state used by the live bracket."""
+    rows: list[dict[str, Any]] = []
+    champion = team_by_id(state, state.get("champion_id"))
+    champion_name = champion["name"] if champion else ""
+    for key, title, round_name in MATCHES:
+        result = state.get("results", {}).get(key, {})
+        if not result.get("winner_id"):
+            continue
+        team_a = team_by_id(state, result.get("team_a_id"))
+        team_b = team_by_id(state, result.get("team_b_id"))
+        winner = team_by_id(state, result.get("winner_id"))
+        rows.append({
+            "Section": SECTION_LABELS[section_id],
+            "Round": round_name,
+            "Match": title,
+            "Team 1": team_a["name"] if team_a else "Unknown",
+            "Team 1 Seed": team_a["seed"] if team_a else "",
+            "Score 1": result.get("score_a", ""),
+            "Team 2": team_b["name"] if team_b else "Unknown",
+            "Team 2 Seed": team_b["seed"] if team_b else "",
+            "Score 2": result.get("score_b", ""),
+            "Winner": winner["name"] if winner else "Unknown",
+            "Champion": champion_name,
+        })
+    return rows
+
+
+def make_csv_export(section_states: list[tuple[str, dict[str, Any]]]) -> bytes:
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=EXPORT_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for section_id, state in section_states:
+        writer.writerows(completed_export_rows(section_id, state))
+    # UTF-8 BOM helps Excel open team names correctly on Windows.
+    return ("\ufeff" + output.getvalue()).encode("utf-8")
+
+
+def make_excel_export(section_states: list[tuple[str, dict[str, Any]]]) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    workbook = Workbook()
+    default_sheet = workbook.active
+    workbook.remove(default_sheet)
+    for section_id, state in section_states:
+        sheet_name = SECTION_LABELS[section_id]
+        worksheet = workbook.create_sheet(title=sheet_name)
+        worksheet.append([f"{sheet_name} Tournament Results"])
+        worksheet.append([f"Exported: {datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}"])
+        worksheet.append([])
+        worksheet.append(EXPORT_COLUMNS[1:])
+        for row in completed_export_rows(section_id, state):
+            worksheet.append([row[column] for column in EXPORT_COLUMNS[1:]])
+
+        worksheet.freeze_panes = "A5"
+        worksheet.auto_filter.ref = f"A4:{get_column_letter(len(EXPORT_COLUMNS) - 1)}{max(4, worksheet.max_row)}"
+        for cell in worksheet[4]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="1F4E78")
+            cell.alignment = Alignment(horizontal="center")
+        for column_cells in worksheet.columns:
+            column_letter = get_column_letter(column_cells[0].column)
+            max_length = max((len(str(cell.value or "")) for cell in column_cells), default=10)
+            worksheet.column_dimensions[column_letter].width = min(max(max_length + 3, 12), 32)
+        worksheet.sheet_view.showGridLines = False
+
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
 
 DESCENDANTS = {
     "M1": {"M3", "LB1", "LB3", "LB4", "GF", "RESET"},
@@ -362,6 +443,15 @@ def main_page(client: Client) -> None:
                     ui.label(champion["name"] if champion else "Champion").classes("text-2xl font-bold text-green-900")
 
             if admin:
+                with ui.card().classes("w-full"):
+                    ui.label("Export tournament results").classes("font-semibold")
+                    ui.label("Exports use the saved Supabase bracket data and do not modify it.").classes("text-sm text-gray-500")
+                    with ui.row().classes("w-full items-center gap-2 flex-wrap"):
+                        ui.button("This section · Excel", icon="table_view", on_click=lambda sid=section_id: export_current_excel(sid))
+                        ui.button("This section · CSV", icon="description", on_click=lambda sid=section_id: export_current_csv(sid)).props("outline")
+                        ui.button("All 7 sections · Excel", icon="library_books", on_click=export_all_excel)
+                        ui.button("All 7 sections · CSV", icon="download", on_click=export_all_csv).props("outline")
+
                 with ui.row().classes("w-full justify-end"):
                     ui.button(
                         "Reset this section",
@@ -369,6 +459,38 @@ def main_page(client: Client) -> None:
                         color="negative",
                         on_click=lambda: confirm_reset(section_id),
                     ).props("outline")
+
+    def export_current_csv(section_id: str) -> None:
+        if not current_user_is_admin():
+            ui.notify("Administrator access is required to export results.", type="negative")
+            return
+        state = load_section(section_id)
+        payload = make_csv_export([(section_id, state)])
+        ui.download(payload, f"{section_id}_tournament_results.csv")
+
+    def export_current_excel(section_id: str) -> None:
+        if not current_user_is_admin():
+            ui.notify("Administrator access is required to export results.", type="negative")
+            return
+        state = load_section(section_id)
+        payload = make_excel_export([(section_id, state)])
+        ui.download(payload, f"{section_id}_tournament_results.xlsx")
+
+    def export_all_csv() -> None:
+        if not current_user_is_admin():
+            ui.notify("Administrator access is required to export results.", type="negative")
+            return
+        states = [(sid, load_section(sid)) for sid in SECTION_IDS]
+        payload = make_csv_export(states)
+        ui.download(payload, "all_sections_tournament_results.csv")
+
+    def export_all_excel() -> None:
+        if not current_user_is_admin():
+            ui.notify("Administrator access is required to export results.", type="negative")
+            return
+        states = [(sid, load_section(sid)) for sid in SECTION_IDS]
+        payload = make_excel_export(states)
+        ui.download(payload, "all_sections_tournament_results.xlsx")
 
     def change_section(section_id: str) -> None:
         selected_section["id"] = section_id
