@@ -1,93 +1,545 @@
+import json
 import os
-from nicegui import Client, ui
+import secrets
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
-# Shared state in server memory (visible to all connected computers)
-bracket = {
-    "sf1": ["Team A", "Team B"],
-    "sf2": ["Team C", "Team D"],
-    "finals": ["TBD", "TBD"],
-    "champion": "TBD",
+from nicegui import Client, app, ui
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
+LOGO_DIR = DATA_DIR / "team_logos"
+DB_PATH = Path(os.getenv("DATABASE_PATH", str(DATA_DIR / "tournament.sqlite3")))
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+STORAGE_SECRET = os.getenv("STORAGE_SECRET") or secrets.token_urlsafe(48)
+PORT = int(os.getenv("PORT", "8080"))
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+LOGO_DIR.mkdir(parents=True, exist_ok=True)
+
+SECTION_IDS = [f"section_{n}" for n in range(1, 8)]
+SECTION_LABELS = {f"section_{n}": f"Section {n}" for n in range(1, 8)}
+
+# Matches are calculated from this dependency graph.
+# M1/M2: opening round; M3/M4: seeds 1/2 enter; M5: winners final.
+# LB1/LB2: first losers-bracket round; LB3: losers-bracket semifinal;
+# LB4: losers-bracket final; GF: grand final; RESET: conditional reset final.
+MATCHES = [
+    ("M1", "Match 1", "Winners Bracket"),
+    ("M2", "Match 2", "Winners Bracket"),
+    ("M3", "Match 3", "Winners Bracket"),
+    ("M4", "Match 4", "Winners Bracket"),
+    ("M5", "Match 5", "Winners Bracket Final"),
+    ("LB1", "Losers Match 1", "Losers Bracket"),
+    ("LB2", "Losers Match 2", "Losers Bracket"),
+    ("LB3", "Losers Match 3", "Losers Bracket"),
+    ("LB4", "Losers Match 4", "Losers Bracket Final"),
+    ("GF", "Match 6", "Grand Final"),
+    ("RESET", "L6 Option — Championship Reset", "Grand Final"),
+]
+
+DESCENDANTS = {
+    "M1": {"M3", "LB1", "LB3", "LB4", "GF", "RESET"},
+    "M2": {"M4", "LB1", "LB3", "LB4", "GF", "RESET"},
+    "M3": {"M5", "LB2", "LB3", "LB4", "GF", "RESET"},
+    "M4": {"M5", "LB2", "LB3", "LB4", "GF", "RESET"},
+    "M5": {"LB4", "GF", "RESET"},
+    "LB1": {"LB3", "LB4", "GF", "RESET"},
+    "LB2": {"LB3", "LB4", "GF", "RESET"},
+    "LB3": {"LB4", "GF", "RESET"},
+    "LB4": {"GF", "RESET"},
+    "GF": {"RESET"},
+    "RESET": set(),
 }
 
-# Store all active refreshable UI callbacks across connected browsers
+
+def blank_section() -> dict[str, Any]:
+    return {
+        "teams": [
+            {"id": str(uuid.uuid4()), "seed": seed, "name": f"Team {seed}", "logo": None}
+            for seed in range(1, 7)
+        ],
+        "results": {},
+        "champion_id": None,
+    }
+
+
+def connect_db() -> sqlite3.Connection:
+    connection = sqlite3.connect(DB_PATH, timeout=30)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def initialize_database() -> None:
+    with connect_db() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS sections (
+                section_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        for section_id in SECTION_IDS:
+            exists = db.execute(
+                "SELECT 1 FROM sections WHERE section_id = ?", (section_id,)
+            ).fetchone()
+            if not exists:
+                db.execute(
+                    "INSERT INTO sections VALUES (?, ?, ?)",
+                    (
+                        section_id,
+                        json.dumps(blank_section()),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+
+
+def load_section(section_id: str) -> dict[str, Any]:
+    with connect_db() as db:
+        row = db.execute(
+            "SELECT state_json FROM sections WHERE section_id = ?", (section_id,)
+        ).fetchone()
+    if row is None:
+        return blank_section()
+    return json.loads(row["state_json"])
+
+
+def save_section(section_id: str, state: dict[str, Any]) -> None:
+    with connect_db() as db:
+        db.execute(
+            """INSERT INTO sections(section_id, state_json, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(section_id) DO UPDATE SET
+                   state_json=excluded.state_json,
+                   updated_at=excluded.updated_at""",
+            (
+                section_id,
+                json.dumps(state),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+
+initialize_database()
+
+
+# ---------------------------------------------------------------------------
+# Bracket engine
+# ---------------------------------------------------------------------------
+
+def team_by_id(state: dict[str, Any], team_id: str | None) -> dict | None:
+    if not team_id:
+        return None
+    return next((team for team in state["teams"] if team["id"] == team_id), None)
+
+
+def result_winner(state: dict[str, Any], key: str) -> str | None:
+    result = state["results"].get(key, {})
+    return result.get("winner_id")
+
+
+def result_loser(state: dict[str, Any], key: str) -> str | None:
+    result = state["results"].get(key, {})
+    a, b, winner = result.get("team_a_id"), result.get("team_b_id"), result.get("winner_id")
+    if not winner or not a or not b:
+        return None
+    return b if winner == a else a
+
+
+def participants(state: dict[str, Any], key: str) -> tuple[str | None, str | None]:
+    teams = sorted(state["teams"], key=lambda team: team["seed"])
+    seed = {team["seed"]: team["id"] for team in teams}
+    winner = lambda match: result_winner(state, match)
+    loser = lambda match: result_loser(state, match)
+
+    mapping = {
+        "M1": (seed.get(4), seed.get(5)),
+        "M2": (seed.get(3), seed.get(6)),
+        "M3": (seed.get(1), winner("M1")),
+        "M4": (seed.get(2), winner("M2")),
+        "M5": (winner("M3"), winner("M4")),
+        "LB1": (loser("M1"), loser("M2")),
+        "LB2": (loser("M3"), loser("M4")),
+        "LB3": (winner("LB1"), winner("LB2")),
+        "LB4": (winner("LB3"), loser("M5")),
+        "GF": (winner("M5"), winner("LB4")),
+        "RESET": (winner("GF"), loser("GF")),
+    }
+    return mapping.get(key, (None, None))
+
+
+def invalidate_descendants(state: dict[str, Any], match_key: str) -> None:
+    for descendant in DESCENDANTS.get(match_key, set()):
+        state["results"].pop(descendant, None)
+    state["champion_id"] = None
+
+
+def refresh_champion(state: dict[str, Any]) -> None:
+    gf_winner = result_winner(state, "GF")
+    gf_loser = result_loser(state, "GF")
+    if not gf_winner:
+        state["champion_id"] = None
+        return
+
+    # If the losers-bracket finalist wins the first grand final, both finalists
+    # now have one loss, so the reset match is required.
+    losers_bracket_champion = participants(state, "GF")[1]
+    if gf_winner == losers_bracket_champion:
+        state["champion_id"] = result_winner(state, "RESET")
+    else:
+        state["champion_id"] = gf_winner
+
+
+def save_match_result(
+    section_id: str,
+    key: str,
+    score_a: int | None,
+    score_b: int | None,
+    override_winner: str | None = None,
+) -> None:
+    state = load_section(section_id)
+    a, b = participants(state, key)
+    if not a or not b:
+        raise ValueError("This match is not ready: both teams must be determined first.")
+    if score_a is None or score_b is None:
+        raise ValueError("Enter both scores before saving.")
+    if score_a == score_b and not override_winner:
+        raise ValueError("A tied score needs an administrator to select the winner.")
+    winner = override_winner
+    if winner is None:
+        winner = a if score_a > score_b else b
+    if winner not in (a, b):
+        raise ValueError("The selected winner must be one of the teams in this match.")
+
+    invalidate_descendants(state, key)
+    state["results"][key] = {
+        "team_a_id": a,
+        "team_b_id": b,
+        "score_a": score_a,
+        "score_b": score_b,
+        "winner_id": winner,
+    }
+    refresh_champion(state)
+    save_section(section_id, state)
+
+
+def clear_match(section_id: str, key: str) -> None:
+    state = load_section(section_id)
+    state["results"].pop(key, None)
+    invalidate_descendants(state, key)
+    refresh_champion(state)
+    save_section(section_id, state)
+
+
+# ---------------------------------------------------------------------------
+# Shared live refresh
+# ---------------------------------------------------------------------------
+
 refresh_callbacks = set()
 
 
-def broadcast_update():
+def broadcast_update() -> None:
     for callback in list(refresh_callbacks):
-        callback()
+        try:
+            callback()
+        except Exception:
+            # A disconnected browser may briefly remain in this set.
+            refresh_callbacks.discard(callback)
 
 
-def advance_team(match_key: str, slot_index: int, team_name: str):
-    if team_name == "TBD":
-        return
-
-    if match_key == "finals":
-        bracket["finals"][slot_index] = team_name
-    elif match_key == "champion":
-        bracket["champion"] = team_name
-
-    # Immediately push the updated UI to all connected computers
-    broadcast_update()
+def is_admin(client: Client) -> bool:
+    return bool(client.storage.user.get("is_admin"))
 
 
-def reset_bracket():
-    bracket["finals"] = ["TBD", "TBD"]
-    bracket["champion"] = "TBD"
-    broadcast_update()
+def team_label(state: dict[str, Any], team_id: str | None) -> str:
+    team = team_by_id(state, team_id)
+    return f"#{team['seed']} {team['name']}" if team else "TBD"
 
+
+def match_status(state: dict[str, Any], key: str) -> str:
+    a, b = participants(state, key)
+    if not a or not b:
+        return "Waiting for previous results"
+    if result_winner(state, key):
+        return "Complete"
+    return "Ready to play"
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
 
 @ui.page("/")
-def main_page(client: Client):
+def main_page(client: Client) -> None:
+    selected_section = {"id": "section_1"}
+
     @ui.refreshable
-    def render_bracket():
-        with ui.row().classes("gap-12 items-center p-6"):
-            # Round 1: Semifinals
-            with ui.column().classes("gap-8"):
-                ui.label("Semifinals").classes("text-lg font-bold")
+    def render_application() -> None:
+        section_id = selected_section["id"]
+        state = load_section(section_id)
+        admin = is_admin(client)
 
-                # Match 1
-                with ui.card().classes("w-48"):
-                    for team in bracket["sf1"]:
-                        ui.button(
-                            team,
-                            on_click=lambda t=team: advance_team("finals", 0, t),
-                        ).classes("w-full")
+        with ui.column().classes("w-full max-w-7xl mx-auto p-3 md:p-6 gap-4"):
+            with ui.row().classes("w-full items-center justify-between"):
+                with ui.column().classes("gap-0"):
+                    ui.label("Live Tournament Manager").classes("text-2xl font-bold")
+                    ui.label("Six-team double-elimination tournament").classes("text-sm text-gray-500")
+                with ui.row().classes("items-center gap-2"):
+                    ui.badge("LIVE", color="positive")
+                    if admin:
+                        ui.badge("ADMIN MODE", color="primary")
+                    else:
+                        ui.badge("PUBLIC VIEW", color="grey")
 
-                # Match 2
-                with ui.card().classes("w-48"):
-                    for team in bracket["sf2"]:
-                        ui.button(
-                            team,
-                            on_click=lambda t=team: advance_team("finals", 1, t),
-                        ).classes("w-full")
+            with ui.card().classes("w-full"):
+                with ui.row().classes("w-full items-center justify-between"):
+                    ui.label("Tournament Section").classes("font-semibold")
+                    ui.select(
+                        options=SECTION_LABELS,
+                        value=section_id,
+                        on_change=lambda event: change_section(event.value),
+                    ).classes("w-48")
 
-            # Round 2: Finals
-            with ui.column().classes("gap-4"):
-                ui.label("Finals").classes("text-lg font-bold")
-                with ui.card().classes("w-48"):
-                    for team in bracket["finals"]:
-                        ui.button(
-                            team,
-                            on_click=lambda t=team: advance_team("champion", 0, t),
-                        ).classes("w-full")
+                if admin:
+                    with ui.expansion("Team setup and registration", icon="groups").classes("w-full"):
+                        for team in sorted(state["teams"], key=lambda item: item["seed"]):
+                            with ui.row().classes("w-full items-center gap-2"):
+                                ui.label(f"Seed {team['seed']}").classes("w-16 text-sm")
+                                name_input = ui.input(
+                                    value=team["name"],
+                                    placeholder="Team name",
+                                ).classes("flex-grow")
+                                name_input.on(
+                                    "blur",
+                                    lambda e, tid=team["id"], inp=name_input: update_team_name(
+                                        section_id, tid, inp.value
+                                    ),
+                                )
+                                if team.get("logo"):
+                                    ui.image(team["logo"]).classes("w-10 h-10 object-contain")
+                                ui.upload(
+                                    label="Logo",
+                                    auto_upload=True,
+                                    on_upload=lambda e, tid=team["id"]: upload_logo(
+                                        section_id, tid, e
+                                    ),
+                                ).props("accept=.png,.jpg,.jpeg,.webp max-files=1").classes("max-w-36")
 
-            # Champion Display
-            with ui.column().classes("gap-4"):
-                ui.label("Champion").classes("text-lg font-bold text-green-600")
-                with ui.card().classes("w-48 bg-green-50 items-center"):
-                    ui.label(bracket["champion"]).classes("text-xl font-bold")
 
-    # Register this browser tab for global updates and remove it on disconnect
-    refresh_callbacks.add(render_bracket.refresh)
-    client.on_disconnect(lambda: refresh_callbacks.discard(render_bracket.refresh))
+            if not admin:
+                with ui.row().classes("w-full items-center justify-between"):
+                    ui.label("Tournament bracket").classes("text-xl font-bold")
+                    ui.label("Results update automatically across connected devices").classes("text-xs text-gray-500")
 
-    # Main Page Layout
-    ui.label("Live Tournament Bracket").classes("text-2xl font-bold px-6 pt-6")
-    render_bracket()
-    ui.button("Reset Bracket", on_click=reset_bracket, color="red").classes("mx-6")
+            render_match_groups(section_id, state, admin)
+
+            if state.get("champion_id"):
+                champion = team_by_id(state, state["champion_id"])
+                with ui.card().classes("w-full bg-green-50 border border-green-200"):
+                    ui.label("TOURNAMENT CHAMPION").classes("text-sm font-bold text-green-800")
+                    ui.label(champion["name"] if champion else "Champion").classes("text-2xl font-bold text-green-900")
+
+            if admin:
+                with ui.row().classes("w-full justify-end"):
+                    ui.button(
+                        "Reset this section",
+                        icon="restart_alt",
+                        color="negative",
+                        on_click=lambda: confirm_reset(section_id),
+                    ).props("outline")
+
+    def change_section(section_id: str) -> None:
+        selected_section["id"] = section_id
+        render_application.refresh()
+
+    def update_team_name(section_id: str, team_id: str, name: str) -> None:
+        if not is_admin(client):
+            return
+        state = load_section(section_id)
+        team = team_by_id(state, team_id)
+        if team and name.strip():
+            team["name"] = name.strip()
+            save_section(section_id, state)
+            broadcast_update()
+
+    async def upload_logo(section_id: str, team_id: str, event) -> None:
+        if not is_admin(client):
+            return
+        filename = Path(event.file.name).name
+        suffix = Path(filename).suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+            ui.notify("Unsupported logo format.", type="negative")
+            return
+        content = await event.file.read()
+        safe_name = f"{section_id}_{team_id}{suffix}"
+        destination = LOGO_DIR / safe_name
+        destination.write_bytes(content)
+        state = load_section(section_id)
+        team = team_by_id(state, team_id)
+        if team:
+            team["logo"] = f"/logos/{safe_name}"
+            save_section(section_id, state)
+        broadcast_update()
+        ui.notify("Team logo uploaded.", type="positive")
+
+    def confirm_reset(section_id: str) -> None:
+        with ui.dialog() as dialog, ui.card():
+            ui.label(f"Reset all matches and scores for {SECTION_LABELS[section_id]}?")
+            ui.label("Team names and logos will be preserved.").classes("text-sm text-gray-500")
+            with ui.row().classes("justify-end"):
+                ui.button("Cancel", on_click=dialog.close).props("flat")
+                ui.button(
+                    "Reset tournament",
+                    color="negative",
+                    on_click=lambda: do_reset(section_id, dialog),
+                )
+        dialog.open()
+
+    def do_reset(section_id: str, dialog) -> None:
+        state = load_section(section_id)
+        state["results"] = {}
+        state["champion_id"] = None
+        save_section(section_id, state)
+        dialog.close()
+        broadcast_update()
+
+    def render_match_groups(section_id: str, state: dict, admin: bool) -> None:
+        groups = [
+            ("Winners Bracket", ["M1", "M2", "M3", "M4", "M5"]),
+            ("Losers Bracket", ["LB1", "LB2", "LB3", "LB4"]),
+            ("Championship", ["GF", "RESET"]),
+        ]
+        for group_name, keys in groups:
+            with ui.card().classes("w-full"):
+                ui.label(group_name).classes("text-lg font-bold")
+                with ui.grid(columns=1).classes("w-full md:grid-cols-2 xl:grid-cols-3 gap-3"):
+                    for key in keys:
+                        render_match_card(section_id, state, key, admin)
+
+    def render_match_card(section_id: str, state: dict, key: str, admin: bool) -> None:
+        a, b = participants(state, key)
+        result = state["results"].get(key, {})
+        status = match_status(state, key)
+        if key == "RESET":
+            gf_winner = result_winner(state, "GF")
+            lb_finalist = participants(state, "GF")[1]
+            if not gf_winner or gf_winner != lb_finalist:
+                return
+
+        with ui.card().classes("w-full border"):
+            with ui.row().classes("w-full items-center justify-between"):
+                ui.label(dict((k, title) for k, title, _ in MATCHES)[key]).classes("font-semibold")
+                ui.badge(status, color="positive" if status == "Complete" else "warning" if status == "Ready to play" else "grey")
+
+            for team_id, score_key in ((a, "score_a"), (b, "score_b")):
+                team = team_by_id(state, team_id)
+                with ui.row().classes("w-full items-center gap-2"):
+                    if team and team.get("logo"):
+                        ui.image(team["logo"]).classes("w-8 h-8 object-contain")
+                    ui.label(team_label(state, team_id)).classes("flex-grow text-sm")
+                    if result.get("winner_id") == team_id:
+                        ui.icon("emoji_events", color="positive")
+                    if result and score_key in result:
+                        ui.label(str(result[score_key])).classes("font-bold min-w-6 text-right")
+
+            if admin and a and b:
+                with ui.expansion("Enter / edit result", icon="edit").classes("w-full"):
+                    score_a = ui.number("Score — " + team_label(state, a), value=result.get("score_a"), min=0, step=1).classes("w-full")
+                    score_b = ui.number("Score — " + team_label(state, b), value=result.get("score_b"), min=0, step=1).classes("w-full")
+                    winner_options = {
+                        a: team_label(state, a),
+                        b: team_label(state, b),
+                    }
+                    override = ui.select(
+                        winner_options,
+                        label="Winner override (optional)",
+                        value=result.get("winner_id"),
+                    ).classes("w-full")
+                    ui.label("Leave winner override blank to use the higher score.").classes("text-xs text-gray-500")
+
+                    def save_clicked(
+                        match_key=key,
+                        sa=score_a,
+                        sb=score_b,
+                        ov=override,
+                    ) -> None:
+                        try:
+                            save_match_result(
+                                section_id,
+                                match_key,
+                                int(sa.value) if sa.value is not None else None,
+                                int(sb.value) if sb.value is not None else None,
+                                ov.value,
+                            )
+                            broadcast_update()
+                            ui.notify("Match result saved and bracket updated.", type="positive")
+                        except (ValueError, TypeError) as error:
+                            ui.notify(str(error), type="negative")
+
+                    with ui.row().classes("w-full justify-end"):
+                        if result:
+                            ui.button(
+                                "Clear result",
+                                color="negative",
+                                on_click=lambda match_key=key: clear_and_refresh(section_id, match_key),
+                            ).props("flat")
+                        ui.button("Save result", icon="save", on_click=save_clicked)
+
+    def clear_and_refresh(section_id: str, key: str) -> None:
+        clear_match(section_id, key)
+        broadcast_update()
+
+    # Public header / administrator sign-in
+    with ui.column().classes("w-full"):
+        with ui.row().classes("w-full justify-end p-3"):
+            if is_admin(client):
+                ui.button(
+                    "Log out",
+                    icon="logout",
+                    on_click=lambda: logout(),
+                ).props("flat")
+            else:
+                with ui.dialog() as login_dialog, ui.card().classes("w-80"):
+                    ui.label("TA Administrator Login").classes("text-lg font-bold")
+                    password = ui.input("Administrator password", password=True, password_toggle_button=True).classes("w-full")
+
+                    def attempt_login() -> None:
+                        if ADMIN_PASSWORD and password.value == ADMIN_PASSWORD:
+                            client.storage.user["is_admin"] = True
+                            login_dialog.close()
+                            render_application.refresh()
+                            ui.notify("Administrator access enabled.", type="positive")
+                        elif not ADMIN_PASSWORD:
+                            ui.notify("Set the ADMIN_PASSWORD environment variable before enabling TA login.", type="negative")
+                        else:
+                            ui.notify("Incorrect password.", type="negative")
+
+                    ui.button("Sign in", on_click=attempt_login).classes("w-full")
+                ui.button("TA Login", icon="lock", on_click=login_dialog.open).props("flat")
+
+    def logout() -> None:
+        client.storage.user["is_admin"] = False
+        render_application.refresh()
+
+    render_application()
+    refresh_callbacks.add(render_application.refresh)
+    client.on_disconnect(lambda: refresh_callbacks.discard(render_application.refresh))
 
 
-# Bind to Render's assigned PORT (defaults to 8080 locally)
-port = int(os.environ.get("PORT", 8080))
-ui.run(host="0.0.0.0", port=port)
+# Serve uploaded logos.
+app.add_static_files("/logos", str(LOGO_DIR))
+
+ui.run(
+    host="0.0.0.0",
+    port=PORT,
+    title="Live Tournament Manager",
+    storage_secret=STORAGE_SECRET,
+    reload=False,
+)
