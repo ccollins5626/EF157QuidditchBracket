@@ -1,6 +1,7 @@
 import json
 import os
 import secrets
+import html
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
