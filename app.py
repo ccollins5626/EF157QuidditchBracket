@@ -68,6 +68,7 @@ def main_page(client: Client):
                 ui.label("Champion").classes("text-lg font-bold text-green-600")
                 with ui.card().classes("w-48 bg-green-50 items-center"):
                     ui.label(bracket["champion"]).classes("text-xl font-bold")
+        pass
 
  refresh_callbacks.add(render_bracket.refresh)
     client.on_disconnect(lambda: refresh_callbacks.discard(render_bracket.refresh))
