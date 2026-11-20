@@ -57,6 +57,30 @@ MATCHES = [
 ]
 
 
+# Display priority for the public "Up Next" panel. A match only appears once
+# both participants are known and the match has not already been completed.
+NEXT_MATCH_ORDER = ["M1", "M2", "M3", "M4", "LB1", "LB2", "M5", "LB3", "LB4", "GF", "RESET"]
+MATCH_TITLES = {key: title for key, title, _ in MATCHES}
+
+
+def next_ready_matches(state: dict[str, Any], limit: int = 2) -> list[tuple[str, str, str]]:
+    """Return the next ready matches as (key, team A id, team B id)."""
+    ready: list[tuple[str, str, str]] = []
+    for key in NEXT_MATCH_ORDER:
+        a, b = participants(state, key)
+        if not a or not b or result_winner(state, key):
+            continue
+        if key == "RESET":
+            gf_winner = result_winner(state, "GF")
+            losers_bracket_finalist = participants(state, "GF")[1]
+            if not gf_winner or gf_winner != losers_bracket_finalist:
+                continue
+        ready.append((key, a, b))
+        if len(ready) >= limit:
+            break
+    return ready
+
+
 EXPORT_COLUMNS = [
     "Section", "Round", "Match", "Team 1", "Team 1 Seed", "Score 1",
     "Team 2", "Team 2 Seed", "Score 2", "Winner", "Champion",
@@ -435,6 +459,7 @@ def main_page(client: Client) -> None:
                     ui.label("Results update automatically across connected devices").classes("text-xs text-gray-500")
 
             render_match_groups(section_id, state, admin)
+            render_up_next_panel(state)
 
             if state.get("champion_id"):
                 champion = team_by_id(state, state["champion_id"])
@@ -459,6 +484,45 @@ def main_page(client: Client) -> None:
                         color="negative",
                         on_click=lambda: confirm_reset(section_id),
                     ).props("outline")
+
+    def render_up_next_panel(state: dict[str, Any]) -> None:
+        """Show the next two ready matches in a persistent bottom-right overlay."""
+        upcoming = next_ready_matches(state, limit=2)
+        with ui.card().style(
+            "position: fixed; right: 18px; bottom: 18px; z-index: 1000; "
+            "width: 310px; max-width: calc(100vw - 36px); "
+            "box-shadow: 0 8px 28px rgba(15, 23, 42, 0.20); "
+            "border: 1px solid #bfdbfe; border-radius: 14px;"
+        ).classes("bg-white"):
+            with ui.row().classes("w-full items-center justify-between"):
+                ui.label("UP NEXT").classes("text-sm font-extrabold tracking-wider text-blue-800")
+                ui.icon("schedule", color="primary").classes("text-lg")
+            if upcoming:
+                for index, (key, team_a_id, team_b_id) in enumerate(upcoming):
+                    if index == 1:
+                        ui.separator().classes("my-1")
+                    heading = "UP NEXT" if index == 0 else "ON DECK"
+                    with ui.column().classes("w-full gap-1"):
+                        ui.label(f"{heading} · {MATCH_TITLES[key]}").classes(
+                            "text-xs font-bold text-gray-500 tracking-wide"
+                        )
+                        ui.label(team_label(state, team_a_id)).classes(
+                            "text-sm font-semibold text-gray-900 leading-tight"
+                        )
+                        ui.label("vs.").classes("text-xs text-gray-400")
+                        ui.label(team_label(state, team_b_id)).classes(
+                            "text-sm font-semibold text-gray-900 leading-tight"
+                        )
+            elif state.get("champion_id"):
+                champion = team_by_id(state, state["champion_id"])
+                ui.label("Tournament complete").classes("font-semibold text-green-700")
+                ui.label(champion["name"] if champion else "Champion determined").classes(
+                    "text-sm text-gray-700"
+                )
+            else:
+                ui.label("Waiting for previous match results.").classes(
+                    "text-sm text-gray-600"
+                )
 
     def export_current_csv(section_id: str) -> None:
         if not current_user_is_admin():
