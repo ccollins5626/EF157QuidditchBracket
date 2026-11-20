@@ -1,28 +1,36 @@
 import json
 import os
 import secrets
-import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from nicegui import Client, app, ui
+from supabase import create_client
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
-LOGO_DIR = DATA_DIR / "team_logos"
-DB_PATH = Path(os.getenv("DATABASE_PATH", str(DATA_DIR / "tournament.sqlite3")))
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
-STORAGE_SECRET = os.getenv("STORAGE_SECRET") or secrets.token_urlsafe(48)
+STORAGE_SECRET = os.getenv("STORAGE_SECRET")
 PORT = int(os.getenv("PORT", "8080"))
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "team-logos")
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-LOGO_DIR.mkdir(parents=True, exist_ok=True)
+if not ADMIN_PASSWORD:
+    raise RuntimeError("Missing ADMIN_PASSWORD environment variable.")
+if not STORAGE_SECRET:
+    raise RuntimeError("Missing STORAGE_SECRET environment variable.")
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError(
+        "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variable."
+    )
+
+# This client is server-side only. Never expose the service-role key to browsers.
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 SECTION_IDS = [f"section_{n}" for n in range(1, 8)]
 SECTION_LABELS = {f"section_{n}": f"Section {n}" for n in range(1, 8)}
@@ -71,64 +79,48 @@ def blank_section() -> dict[str, Any]:
     }
 
 
-def connect_db() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH, timeout=30)
-    connection.row_factory = sqlite3.Row
-    return connection
-
-
 def initialize_database() -> None:
-    with connect_db() as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS sections (
-                section_id TEXT PRIMARY KEY,
-                state_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
-        for section_id in SECTION_IDS:
-            exists = db.execute(
-                "SELECT 1 FROM sections WHERE section_id = ?", (section_id,)
-            ).fetchone()
-            if not exists:
-                db.execute(
-                    "INSERT INTO sections VALUES (?, ?, ?)",
-                    (
-                        section_id,
-                        json.dumps(blank_section()),
-                        datetime.now(timezone.utc).isoformat(),
-                    ),
-                )
+    """Create only missing section records; never overwrite existing brackets."""
+    for section_id in SECTION_IDS:
+        response = (
+            supabase.table("sections")
+            .select("section_id")
+            .eq("section_id", section_id)
+            .limit(1)
+            .execute()
+        )
+        if not response.data:
+            save_section(section_id, blank_section())
 
 
 def load_section(section_id: str) -> dict[str, Any]:
-    with connect_db() as db:
-        row = db.execute(
-            "SELECT state_json FROM sections WHERE section_id = ?", (section_id,)
-        ).fetchone()
-    if row is None:
-        return blank_section()
-    return json.loads(row["state_json"])
+    response = (
+        supabase.table("sections")
+        .select("state_json")
+        .eq("section_id", section_id)
+        .limit(1)
+        .execute()
+    )
+    if not response.data:
+        state = blank_section()
+        save_section(section_id, state)
+        return state
+    # Supabase returns JSONB as a native Python dict.
+    return response.data[0]["state_json"]
 
 
 def save_section(section_id: str, state: dict[str, Any]) -> None:
-    with connect_db() as db:
-        db.execute(
-            """INSERT INTO sections(section_id, state_json, updated_at)
-               VALUES (?, ?, ?)
-               ON CONFLICT(section_id) DO UPDATE SET
-                   state_json=excluded.state_json,
-                   updated_at=excluded.updated_at""",
-            (
-                section_id,
-                json.dumps(state),
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
+    supabase.table("sections").upsert(
+        {
+            "section_id": section_id,
+            "state_json": state,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        on_conflict="section_id",
+    ).execute()
 
 
 initialize_database()
-
 
 # ---------------------------------------------------------------------------
 # Bracket engine
@@ -378,13 +370,30 @@ def main_page(client: Client) -> None:
             ui.notify("Unsupported logo format.", type="negative")
             return
         content = await event.file.read()
-        safe_name = f"{section_id}_{team_id}{suffix}"
-        destination = LOGO_DIR / safe_name
-        destination.write_bytes(content)
+        if len(content) > 2 * 1024 * 1024:
+            ui.notify("Logo files must be 2 MB or smaller.", type="negative")
+            return
+
+        content_types = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+        }
+        content_type = content_types[suffix]
+        # A unique path avoids stale CDN-cached images when a logo is replaced.
+        object_path = f"{section_id}/{team_id}/{uuid.uuid4().hex}{suffix}"
+        supabase.storage.from_(SUPABASE_BUCKET).upload(
+            object_path,
+            content,
+            {"content-type": content_type, "cache-control": "3600"},
+        )
+        public_url = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(object_path)
+
         state = load_section(section_id)
         team = team_by_id(state, team_id)
         if team:
-            team["logo"] = f"/logos/{safe_name}"
+            team["logo"] = public_url
             save_section(section_id, state)
         broadcast_update()
         ui.notify("Team logo uploaded.", type="positive")
@@ -532,9 +541,6 @@ def main_page(client: Client) -> None:
     refresh_callbacks.add(render_application.refresh)
     client.on_disconnect(lambda: refresh_callbacks.discard(render_application.refresh))
 
-
-# Serve uploaded logos.
-app.add_static_files("/logos", str(LOGO_DIR))
 
 ui.run(
     host="0.0.0.0",
